@@ -1,0 +1,232 @@
+**Architecture Document: Multi-SKU Fair Task Scheduler for Tenant Operations**
+
+---
+
+### 1. **Current Architecture**
+
+The current system processes tenant-related operations such as Create, Update, and Delete by executing a sequence of service API calls or Service Bus messages. Each operation is persisted in an `ExecutionInstance` table, which contains the steps required. These steps are further tracked in the `EventInstance` table.
+
+#### Characteristics:
+- Operations are asynchronous.
+- Each operation initiates multiple service-specific actions.
+- All downstream service calls are triggered concurrently with no throttling.
+
+#### Problems:
+- Downstream systems (IAM, IOT, etc.) are overwhelmed under concurrent loads.
+- No limit or queuing on service-specific concurrency.
+- One Product SKU (e.g., mass updates) can dominate system resources (noisy neighbor problem).
+
+---
+
+### 2. **Problem Statement**
+
+**Objective:**
+Introduce a queuing mechanism to:
+
+- Limit concurrent calls per service.
+- Enforce fair scheduling across Product SKUs.
+- Prioritize Create operations over Update/Delete.
+- Avoid concurrent operations for the same tenant-service pair.
+
+---
+
+### 3. **Proposed Architecture**
+
+A centralized background task scheduler picks tasks from a queue, applies fairness rules, and dispatches them to handlers.
+
+#### Key Components:
+- **ServiceTaskQueue Table**: Stores task details (Operation, Service, Product SKU, etc.).
+- **ServiceTaskScheduler**: Central logic to apply fair scheduling, enforce limits, and assign execution.
+- **BackgroundTaskSchedulerService**: Periodically polls the scheduler and executes eligible tasks.
+- **Task Handlers (IAM, IOT, etc.)**: Execute service-specific logic.
+
+#### Scheduling Rules:
+- No more than `MaxConcurrency` tasks per service.
+- Only `PerSkuLimit` pending tasks per SKU are selected.
+- Tasks are processed in **round-robin** fashion across SKUs.
+- Tasks for a tenant already in `InProgress` are skipped.
+- SQL uses `ROW_NUMBER()` for partitioned priority ordering.
+
+---
+
+### 4. **Database Tables**
+
+#### `ServiceTaskQueue`
+| Column             | Type         | Description                         |
+|--------------------|--------------|-------------------------------------|
+| Id                 | GUID         | Unique identifier                   |
+| ExecutionInstanceId| GUID         | Refers to the original execution    |
+| EventInstanceId    | GUID         | Refers to the specific event step   |
+| TenantId           | string       | Unique tenant identifier            |
+| ProductSku         | string       | SKU grouping                        |
+| ServiceName        | string       | IAM, IOT, etc.                      |
+| Operation          | enum         | Create, Update, Delete              |
+| Status             | enum         | Pending, InProgress, Completed, Failed |
+| InsertedAt         | DateTime     | Timestamp of enqueue                |
+| RetryCount         | int          | Retry attempts                      |
+
+---
+
+### 5. **Class and Object Diagrams**
+
+#### Core Classes:
+- `ServiceTaskQueue` – entity model.
+- `ServiceExecutionOptions` – config model per service.
+- `IServiceTaskHandler` – handler contract.
+- `ServiceTaskScheduler` – scheduling logic.
+- `BackgroundTaskSchedulerService` – orchestrates execution.
+
+#### Relationships:
+```
+[BackgroundTaskSchedulerService] 
+    --> (uses) [ServiceTaskScheduler]
+    --> (resolves) [IServiceTaskHandler] via [HandlerType]
+
+[ServiceTaskScheduler] 
+    --> (uses) [ProvisioningDbContext] 
+    --> (reads/writes) [ServiceTaskQueue]
+
+[IServiceTaskHandler] <|-- IamTaskHandler, IotTaskHandler
+```
+
+---
+
+### 6. **Execution Flow Summary**
+
+1. `BackgroundTaskSchedulerService` iterates over configured services.
+2. For each, it invokes `GetScheduledTasksAsync(...)`:
+   - Applies `ROW_NUMBER()` per SKU
+   - Skips if `InProgress >= MaxConcurrency`
+   - Skips if tenant is already in progress
+3. Eligible tasks are executed via `IServiceTaskHandler`.
+4. Task status is updated to `InProgress` → `Completed/Failed`
+
+---
+
+### 7. **Sequence Diagram (PlantUML)**
+```plantuml
+@startuml
+actor Scheduler
+entity Database
+participant ServiceTaskScheduler
+participant TaskHandler
+
+Scheduler -> ServiceTaskScheduler: GetScheduledTasksAsync
+ServiceTaskScheduler -> Database: Fetch InProgress count
+ServiceTaskScheduler -> Database: Fetch pending tasks using ROW_NUMBER()
+ServiceTaskScheduler -> Scheduler: Return tasks
+
+loop for each task
+    Scheduler -> TaskHandler: ExecuteAsync(task)
+    TaskHandler -> Database: Update Status to InProgress
+    TaskHandler -> ExternalService: Call IAM/IOT API
+    TaskHandler -> Database: Update Status to Completed/Failed
+end
+@enduml
+```
+
+---
+
+### 8. **Visual Data Flow Diagram**
+```text
++------------------+           +---------------------+          +-------------------+
+| Tenant Operation |  ---->    | ServiceTaskQueue DB |  --->    | Background Service |
+| (Create/Update)  |           |                     |          | Scheduler          |
++------------------+           +---------------------+          +--------+----------+
+                                                                      |
+                                                                      v
+                                                             +--------+-----------+
+                                                             |  ServiceTaskScheduler|
+                                                             +--------+-----------+
+                                                                      |
+                                                                      v
+                                                             +--------+-----------+
+                                                             | Task Handler (IAM) |
+                                                             | Task Handler (IOT) |
+                                                             +--------------------+
+```
+
+---
+
+### 9. **Observability & Troubleshooting Design**
+
+#### 1. **Structured Logging**
+- Log task transitions with Task ID, Tenant ID, SKU, Operation, and Status.
+- Include retry attempts and exception messages.
+
+#### 2. **Metrics (Prometheus/Grafana)**
+- Number of tasks processed per service/SKU.
+- Current queue length.
+- Average task duration per service.
+- Retry/failure rate.
+
+#### 3. **Health Probes**
+- Expose a `/health/tasks` endpoint with:
+  - Stuck tasks
+  - InProgress older than N mins
+  - Failed tasks with retries > threshold
+
+#### 4. **Alerting**
+- Alert on high retry count.
+- Alert if no tasks processed in X minutes.
+- Alert on DB latency or locking issues.
+
+---
+
+### 10. **Example Scenario**
+
+### 10.1 **SKU Starvation Protection Logic (Visual)**
+
+#### Scheduler Decision Table per Round
+| Round | Slot 1 (MaxConcurrency 1) | Slot 2 | Slot 3 |
+|-------|---------------------------|--------|--------|
+| 1     | A-Create1                 | B-Create1 | C-Create1 |
+| 2     | A-Create2                 | B-Create2 | C-Create2 |
+| 3     | A-Update1                 | B-Update1 | C-Delete1 |
+| 4     | A-Update2                 | B-Update2 | C-Delete2 |
+
+Each round respects concurrency and fairness across SKUs.
+
+```text
+Round Robin Queue Selection:
++-----------+-----------+-----------+
+|  SKU A    |  SKU B    |  SKU C    |
++-----------+-----------+-----------+
+| Create 1  | Create 1  | Create 1  |
+| Create 2  | Create 2  | Create 2  |
+| Update 1  | Update 1  | Delete 1  |
+| Update 2  | Update 2  | Delete 2  |
++-----------+-----------+-----------+
+
+Scheduler Logic:
+1. Scheduler cycles through SKUs in order.
+2. Picks top N (PerSkuLimit) from each SKU using SQL `ROW_NUMBER()`.
+3. Distributes work fairly across SKUs by interleaving operations.
+4. Ensures high-volume SKU (like A) doesn’t block B or C from progressing.
+```
+
+#### Setup:
+- Products: A, B, C
+- `MaxConcurrency = 3`, `PerSkuLimit = 2`
+- Initial Queue:
+```
+Product A: 5 Create, 10 Update
+Product B: 2 Create, 10 Update
+Product C: 2 Create, 10 Delete
+```
+
+#### Step-by-Step Execution:
+1. `ServiceTaskScheduler` applies `ROW_NUMBER()` by SKU and filters top 2 for each.
+2. It picks:
+   - Product A: 2 Create
+   - Product B: 2 Create
+   - Product C: 2 Create
+3. It runs one task per SKU in a round-robin until `MaxConcurrency` is reached (3):
+   - Round 1: A-Create1, B-Create1, C-Create1
+   - Round 2: A-Create2, B-Create2, C-Create2
+4. Once a task completes, it processes more from same SKU (e.g., A-Update1 if Product A has room).
+5. If a tenant is already in progress, that task is skipped in this round.
+
+---
+
+Let me know if you’d like a full deployment diagram or logging schema added.
