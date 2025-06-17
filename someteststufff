@@ -1,0 +1,119 @@
+public class ServiceTaskQueue
+{
+    public Guid Id { get; set; }
+    public Guid ExecutionInstanceId { get; set; }
+    public Guid EventInstanceId { get; set; }
+    public string TenantId { get; set; } = default!;
+    public string ProductSku { get; set; } = default!;
+    public string ServiceName { get; set; } = default!;
+    public TaskOperation Operation { get; set; }
+    public TaskStatus Status { get; set; }
+    public DateTime InsertedAt { get; set; }
+    public int RetryCount { get; set; }
+}
+
+
+public interface IServiceTaskHandler
+{
+    Task ExecuteAsync(ServiceTaskQueue task, CancellationToken ct);
+}
+
+public class ServiceTaskScheduler : IServiceTaskScheduler
+{
+    public async Task<List<ServiceTaskQueue>> GetScheduledTasksAsync(
+        ProvisioningDbContext db, string serviceName, int perSkuLimit, int maxConcurrency, CancellationToken ct)
+    {
+        var inProgressCount = await db.ServiceTaskQueues
+            .CountAsync(t => t.ServiceName == serviceName && t.Status == TaskStatus.InProgress, ct);
+
+        if (inProgressCount >= maxConcurrency)
+            return new List<ServiceTaskQueue>();
+
+        var inProgressTenantIds = await db.ServiceTaskQueues
+            .Where(t => t.ServiceName == serviceName && t.Status == TaskStatus.InProgress)
+            .Select(t => t.TenantId)
+            .Distinct()
+            .ToListAsync(ct);
+
+        var sql = $"""
+            WITH RankedTasks AS (
+                SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY "ProductSku" ORDER BY "Operation", "InsertedAt") AS rank
+                FROM "ServiceTaskQueues"
+                WHERE "ServiceName" = {{0}} AND "Status" = {{1}}
+            )
+            SELECT *
+            FROM RankedTasks
+            WHERE rank <= {{2}}
+        """;
+
+        var ranked = await db.ServiceTaskQueues
+            .FromSqlRaw(sql, serviceName, TaskStatus.Pending, perSkuLimit)
+            .ToListAsync(ct);
+
+        var filtered = ranked
+            .Where(t => !inProgressTenantIds.Contains(t.TenantId))
+            .GroupBy(t => t.ProductSku)
+            .SelectMany(g => g.Take(1))
+            .Take(maxConcurrency)
+            .ToList();
+
+        return filtered;
+    }
+}
+
+public class BackgroundTaskSchedulerService : BackgroundService
+{
+    private readonly IServiceProvider _sp;
+    private readonly ILogger<BackgroundTaskSchedulerService> _logger;
+    private readonly IOptions<List<ServiceExecutionOptions>> _opts;
+
+    public BackgroundTaskSchedulerService(
+        IServiceProvider sp,
+        ILogger<BackgroundTaskSchedulerService> logger,
+        IOptions<List<ServiceExecutionOptions>> opts)
+    {
+        _sp = sp;
+        _logger = logger;
+        _opts = opts;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            foreach (var opt in _opts.Value)
+            {
+                using var scope = _sp.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService<ProvisioningDbContext>();
+                var scheduler = scope.ServiceProvider.GetRequiredService<IServiceTaskScheduler>();
+                var handler = (IServiceTaskHandler)scope.ServiceProvider.GetRequiredService(opt.HandlerType);
+
+                var tasks = await scheduler.GetScheduledTasksAsync(
+                    db, opt.ServiceName, opt.PerSkuLimit, opt.MaxConcurrency, stoppingToken);
+
+                foreach (var task in tasks)
+                {
+                    try
+                    {
+                        task.Status = TaskStatus.InProgress;
+                        await db.SaveChangesAsync(stoppingToken);
+
+                        await handler.ExecuteAsync(task, stoppingToken);
+
+                        task.Status = TaskStatus.Completed;
+                        await db.SaveChangesAsync(stoppingToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error processing task {Id}", task.Id);
+                        task.Status = TaskStatus.Failed;
+                        task.RetryCount++;
+                        await db.SaveChangesAsync(stoppingToken);
+                    }
+                }
+            }
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+        }
+    }
+}
