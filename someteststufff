@@ -12,7 +12,17 @@ public class ServiceTaskQueue
     public int RetryCount { get; set; }
 }
 
-
+public enum TaskStatus
+{
+    Pending = 0,
+    InProgress = 1,
+    Completed = 2,
+    Failed = 3,
+    Canceled = 4,
+    Skipped = 5,
+    Retrying = 6,
+    DeadLettered = 7
+}
 public interface IServiceTaskHandler
 {
     Task ExecuteAsync(ServiceTaskQueue task, CancellationToken ct);
