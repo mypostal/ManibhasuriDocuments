@@ -349,3 +349,91 @@ Once Create tasks finish, Update operations begin across all products — still 
 ROW_NUMBER() + rn <= 1 ensures each product gets a chance per scheduling round, avoiding starvation.
 
 
+
+@startuml
+start
+
+:API: Receive Create/Update/Delete Request;
+:API: Create ExecutionInstance & EventInstance;
+:API: Insert Task into ServiceTaskQueue (Pending);
+note right
+  Task now exists in DB.
+  Background scheduler will pick this up
+  during the next poll cycle.
+end note
+
+:DB: Task persisted in ServiceTaskQueue;
+
+:Scheduler: Background job runs every N seconds;
+:Scheduler: Poll DB for eligible tasks;
+:Scheduler: Apply SKU fairness and concurrency;
+
+if (Eligible task found?) then (yes)
+  :Scheduler: Mark task InProgress;
+  :Scheduler: Call appropriate Handler;
+  if (Handler Success?) then (yes)
+    :Scheduler: Mark task Completed;
+  else (no)
+    :Scheduler: Mark task Failed;
+    :Scheduler: Increment RetryCount;
+  endif
+else (no)
+  :Scheduler: Wait until next cycle;
+endif
+
+stop
+@enduml
+
+
+
+@startuml
+start
+
+:API receives Tenant Create request;
+:Add ExecutionInstance + EventInstance;
+:Add record to ServiceTaskQueue (Status: Pending);
+
+:Background scheduler runs;
+:Load configured services;
+
+while (More services?) is (yes)
+  :Create DI scope;
+  :Resolve Scheduler + TaskQueueService;
+
+  :Get in-progress task count;
+  if (InProgress < MaxConcurrency?) then (yes)
+    :Fetch pending tasks with ROW_NUMBER by SKU;
+
+    :Filter tasks:\n- Max per SKU limit\n- Skip InProgress tenants;
+
+    if (Eligible tasks found?) then (yes)
+      while (More tasks?) is (yes)
+        :Mark task InProgress;
+        :Save status;
+
+        :Execute via IServiceTaskHandler;
+        if (Success?) then (yes)
+          :Mark Completed;
+        else (no)
+          :Mark Failed;
+          :Increment RetryCount;
+        endif
+
+        :Save updated status;
+      endwhile
+    else (no)
+      :Skip to next service;
+    endif
+  else (no)
+    :Wait until capacity frees up;
+  endif
+
+endwhile
+
+:Wait for polling interval;
+goto start
+
+@enduml
+
+
+
