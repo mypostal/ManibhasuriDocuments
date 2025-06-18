@@ -436,4 +436,48 @@ goto start
 @enduml
 
 
+The heart of the proposed system is the ServiceTaskScheduler, which coordinates with the background job to enforce fairness and concurrency limits across service operations. Here's a detailed breakdown of how it operates:
+
+6.1 Task Scheduler Responsibilities
+
+The ServiceTaskScheduler encapsulates all the rules and selection logic required to pick eligible tasks from the ServiceTaskQueue.
+
+Rules Applied:
+
+Concurrency Limiting: Ensures the number of InProgress tasks per service does not exceed its MaxConcurrency.
+
+SKU Fairness: Applies a ROW_NUMBER() over each ProductSku to pick only the top N (configured PerSkuLimit) tasks per SKU.
+
+Tenant Locking: Skips tasks whose TenantId is already in progress, avoiding duplicate parallel execution.
+
+Priority Ordering: Prefers operations in the order of Create > Update > Delete.
+
+6.2 Background Job Lifecycle
+
+The background worker service (BackgroundTaskSchedulerService) runs continuously and performs the following on every interval (e.g., every 5 seconds):
+
+Iterate over Configured Services:
+
+Each service (e.g., IAM, IOT) has an associated handler and execution configuration.
+
+Resolve Task Scheduler & Dependencies:
+
+Uses DI scope to resolve ServiceTaskScheduler, ITaskQueueService, and handler type.
+
+Fetch Scheduled Tasks:
+
+Calls GetScheduledTasksAsync() which applies all fairness and concurrency rules.
+
+Execute Eligible Tasks:
+
+Updates task to InProgress, calls the appropriate handler.
+
+Upon completion, marks task as Completed, or Failed and increments retry count.
+
+Repeat:
+
+Once all services have been checked, waits for the next polling interval.
+
+
+
 
