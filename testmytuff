@@ -230,3 +230,122 @@ Product C: 2 Create, 10 Delete
 ---
 
 Let me know if you’d like a full deployment diagram or logging schema added.
+
+
+ChatGPT said:
+Perfect — let’s break this down step-by-step using your current scheduling setup, where:
+
+Each product should get fair access to processing slots.
+
+Create has higher priority than Update.
+
+Max concurrency per service (e.g., IAM) is 2.
+
+🎯 Scenario Setup
+You have:
+
+Product	Create Tasks	Update Tasks
+A	5	10
+B	2	10
+C	2	10
+D	2	10
+E	2	10
+
+🧱 Scheduling Strategy Recap
+You're using:
+
+ROW_NUMBER() + PARTITION BY ProductSku ORDER BY Operation, InsertedAt
+
+WHERE rn <= 1 → fetch 1 highest-priority task per product
+
+Then apply round-robin or per-SKU fair scheduling
+
+Max 2 concurrent tasks per poll
+
+🧮 SQL Fetch (per service): What gets returned?
+From the raw SQL query:
+
+sql
+Copy
+Edit
+SELECT *
+FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY ProductSku ORDER BY Operation, InsertedAt) AS rn
+  FROM ServiceTaskQueues
+  WHERE Status = 0 AND ServiceName = 'IAM'
+) sub
+WHERE rn <= 1
+✅ This returns:
+
+Product A → 1 Create
+
+Product B → 1 Create
+
+Product C → 1 Create
+
+Product D → 1 Create
+
+Product E → 1 Create
+
+⏱️ Round-by-Round Execution (MaxConcurrency = 2)
+Round 1
+Tasks in memory: A(C1), B(C1), C(C1), D(C1), E(C1)
+
+Round-robin picks: ✅ A(C1), ✅ B(C1)
+
+In-flight: A(C1), B(C1)
+
+Round 2
+A and B completed
+
+Next picks: ✅ C(C1), ✅ D(C1)
+
+Round 3
+C and D completed
+
+Next picks: ✅ E(C1), ✅ A(C2)
+
+Round 4
+E and A completed
+
+Next picks: ✅ A(C3), ✅ B(C2)
+
+Round 5
+A and B completed
+
+Next picks: ✅ C(C2), ✅ D(C2)
+
+Round 6
+C and D completed
+
+Next picks: ✅ E(C2), ✅ A(C4)
+
+Round 7
+E and A completed
+
+Next picks: ✅ A(C5), ✅ B(U1)
+
+From here onward, all Create tasks are done. We begin processing Update tasks based on round-robin fairness.
+
+📊 Summary of Task Flow
+Round	A	B	C	D	E
+1	✅ C1	✅ C1			
+2			✅ C1	✅ C1	
+3	✅ C2				✅ C1
+4	✅ C3	✅ C2			
+5			✅ C2	✅ C2	
+6	✅ C4				✅ C2
+7	✅ C5	✅ U1			
+8	✅ U1	✅ U2			
+...	(rotation continues through updates fairly)				
+
+✅ Key Takeaways
+Product-A, despite having many Create and Update tasks, does not block others.
+
+All Create operations are processed first, due to operation priority.
+
+Once Create tasks finish, Update operations begin across all products — still fair.
+
+ROW_NUMBER() + rn <= 1 ensures each product gets a chance per scheduling round, avoiding starvation.
+
+
