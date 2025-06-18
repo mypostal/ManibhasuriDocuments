@@ -28,6 +28,42 @@ public interface IServiceTaskHandler
     Task ExecuteAsync(ServiceTaskQueue task, CancellationToken ct);
 }
 
+public class TaskQueueService : ITaskQueueService
+{
+    private readonly ProvisioningDbContext _db;
+
+    public TaskQueueService(ProvisioningDbContext db) => _db = db;
+
+    public Task<int> GetInProgressCountAsync(string serviceName, CancellationToken ct) =>
+        _db.ServiceTaskQueues.CountAsync(t => t.ServiceName == serviceName && t.Status == TaskStatus.InProgress, ct);
+
+    public Task<List<string>> GetInProgressTenantIdsAsync(string serviceName, CancellationToken ct) =>
+        _db.ServiceTaskQueues
+            .Where(t => t.ServiceName == serviceName && t.Status == TaskStatus.InProgress)
+            .Select(t => t.TenantId)
+            .Distinct()
+            .ToListAsync(ct);
+
+    public Task<List<ServiceTaskQueue>> GetRankedTasksAsync(string serviceName, TaskStatus status, int perSkuLimit, CancellationToken ct)
+    {
+        var sql = $"""
+        WITH RankedTasks AS (
+            SELECT *,
+            ROW_NUMBER() OVER (PARTITION BY "ProductSku" ORDER BY "Operation", "InsertedAt") AS rank
+            FROM "ServiceTaskQueues"
+            WHERE "ServiceName" = {{0}} AND "Status" = {{1}}
+        )
+        SELECT * FROM RankedTasks WHERE rank <= {{2}}
+        """;
+
+        return _db.ServiceTaskQueues
+            .FromSqlRaw(sql, serviceName, status, perSkuLimit)
+            .ToListAsync(ct);
+    }
+
+    public Task SaveAsync(CancellationToken ct) => _db.SaveChangesAsync(ct);
+}
+
 public class ServiceTaskScheduler : IServiceTaskScheduler
 {
     public async Task<List<ServiceTaskQueue>> GetScheduledTasksAsync(
