@@ -480,4 +480,105 @@ Once all services have been checked, waits for the next polling interval.
 
 
 
+Example Scenario: Mixed Task Distribution
+
+Input Task Load:
+
+10 Create: LSS-DP
+
+2 Create: LSS-BESS
+
+3 Create: APM
+
+1 Create: Sandbox
+
+20 Update: LSS-DP
+
+5 Update: APM
+
+Assumptions:
+
+MaxConcurrency = 4
+
+PerSkuLimit = 2 per round
+
+Round 1:
+
+Slot
+
+Selected Task
+
+1
+
+Create LSS-DP (1)
+
+2
+
+Create LSS-BESS (1)
+
+3
+
+Create APM (1)
+
+4
+
+Create Sandbox (1)
+
+Round 2:
+
+Slot
+
+Selected Task
+
+1
+
+Create LSS-DP (2)
+
+2
+
+Create LSS-BESS (2)
+
+3
+
+Create APM (2)
+
+4
+
+Update LSS-DP (1)
+
+Round 3:
+
+Slot
+
+Selected Task
+
+1
+
+Create LSS-DP (3)
+
+2
+
+Create APM (3)
+
+3
+
+Update LSS-DP (2)
+
+4
+
+Update APM (1)
+
+Round 4 and beyond:
+
+Continue picking top N tasks per SKU, giving fair chances across SKUs while obeying concurrency and per-tenant limits.
+
+Effect:
+
+Noisy LSS-DP SKU does not starve other SKUs.
+
+Concurrency respected.
+
+Create operations prioritized over Updates.
+
+
 
