@@ -1,5 +1,39 @@
 **Architecture Document: Multi-SKU Fair Task Scheduler for Tenant Operations**
 
+
+@startuml
+|Content Owner|
+start
+:Create CWP Menu in UI Builder;
+:Download CWP Menu with Remote URLs;
+:Upload CWP Menu JSON to Content Catalog UI;
+|Validation Logic|
+:Validate Naming Convention (env + region);
+if (Is Valid?) then (yes)
+  |Content Catalog UI|
+  :Create Content Package;
+else (no)
+  :Reject Upload;
+  stop
+endif
+|Release Admin|
+:Promote Content Package to Environment;
+|Release Service|
+:Check for Deployment-specific CWP Menu;
+if (Menu Exists?) then (yes)
+  :Deploy to Environment;
+else (no)
+  :Fail Promotion;
+  stop
+endif
+|Tenant Owner|
+:Create Tenant in TPMS;
+|TPMS|
+:Download Content Package;
+:Provision CWP Menu;
+stop
+@enduml
+
 ---
 
 ### 1. **Current Architecture**
